@@ -53,7 +53,14 @@ bool  showInner = input.bool(true, "Mean − π·R", inline = "d1", group = G_D)
 bool  showSmall = input.bool(true, "Mean − 5.587·R", inline = "d2", group = G_D)
 bool  showOuter = input.bool(true, "Mean − 7.587·R", inline = "d2", group = G_D)
 bool  showSkips = input.bool(true, "Mark skipped setups (no SMC / flow)", group = G_D)
-color colBuy    = input.color(#26a69a, "Color", group = G_D)
+color colBuy    = input.color(#26a69a, "Label color", group = G_D)
+color colZoneIn = input.color(#a8e6b0, "Zones: inner", inline = "zc", group = G_D)
+color colZoneOut = input.color(#1b8a4c, "outer", inline = "zc", group = G_D)
+color colMean   = input.color(color.new(#b0bec5, 45), "Mean", inline = "zc", group = G_D)
+int   fillTransp = input.int(78, "Ribbon fill transparency", minval = 0, maxval = 100, group = G_D)
+int   lineTransp = input.int(45, "Level line transparency", minval = 0, maxval = 100, group = G_D)
+int   lineWOut  = input.int(4, "Line width: −7.587", minval = 1, maxval = 10, inline = "lw", group = G_D)
+int   lineWIn   = input.int(2, "−π, −5.587", minval = 1, maxval = 10, inline = "lw", group = G_D)
 
 // ---------------------------------------------------------------- functions (same as aphelion.pine)
 superSmoother(float src, float period) =>
@@ -314,10 +321,19 @@ if skipNow and showSkips and not na(setupLbl)
     setupLbl.set_color(color.new(color.gray, 50))
 
 // ---------------------------------------------------------------- display
-plot(warm and showMean ? mean : na, "Mean", color.gray, 2)
-plot(warm and showInner ? mean - math.pi * r : na, "Inner -", color.new(colBuy, 70))
-plot(warm and showSmall ? mean - (2.415 * math.pi - 2.0) * r : na, "Small -", color.new(colBuy, 50))
-plot(warm and showOuter ? mean - outerK * r : na, "Outer -", color.new(colBuy, 0), 2)
+// Zone ribbons as in aphelion.pine (buy side only): fills between adjacent levels, inner fainter.
+mix(color a, color b, float t, float transp) =>
+    color.rgb(color.r(a) + (color.r(b) - color.r(a)) * t, color.g(a) + (color.g(b) - color.g(a)) * t, color.b(a) + (color.b(b) - color.b(a)) * t, math.max(0.0, math.min(100.0, transp)))
+
+float ft = fillTransp
+float lt = lineTransp
+pMean = plot(warm ? mean : na, "Mean", showMean ? colMean : na, 1, plot.style_linebr)
+pIn = plot(warm and showInner ? mean - math.pi * r : na, "Inner -", mix(colZoneIn, colZoneOut, 0.0, lt + 15), lineWIn, plot.style_linebr)
+pSm = plot(warm and showSmall ? mean - (2.415 * math.pi - 2.0) * r : na, "Small -", mix(colZoneIn, colZoneOut, 0.35, lt + 5), lineWIn, plot.style_linebr)
+pOut = plot(warm and showOuter ? mean - outerK * r : na, "Outer -", mix(colZoneIn, colZoneOut, 0.7, lt), lineWOut, plot.style_linebr)
+fill(pMean, pIn, mix(colZoneIn, colZoneOut, 0.0, ft + 14), "Ribbon Mean…π −")
+fill(pIn, pSm, mix(colZoneIn, colZoneOut, 0.25, ft + 6), "Ribbon π…5.587 −")
+fill(pSm, pOut, mix(colZoneIn, colZoneOut, 0.55, ft), "Ribbon 5.587…7.587 −")
 
 // Data-window values for the parity check (parity/README.md).
 plot(r, "R", display = display.data_window, precision = 10)

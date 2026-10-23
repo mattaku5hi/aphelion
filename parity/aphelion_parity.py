@@ -496,13 +496,17 @@ def parity(path, mode, skip, rtol, keep_last, dump, m5=None, p=Params):
             if col is None or all(math.isnan(v) for v in col):
                 continue
             col = col[:n]
-            bad = 0
-            for i in range(max(skip, p.warm), n):
-                want = res["mean"][i] + k * res["r"][i]
+            bad, drawn = 0, 0
+            for i in range(skip, n):
+                if math.isnan(col[i]):
+                    # Not drawn on this bar (warm-up, hidden, or a deeper level away from price).
+                    continue
+                drawn += 1
+                want = res["mean"][i] + k * res["r"][i] if i >= p.warm else NAN
                 bad += not close_enough(col[i], want, rtol, 1e-12)
             compared += 1
             ok_all &= bad == 0
-            print(f"  {title:12s} {'OK ' if bad == 0 else 'BAD'} mismatches {bad}")
+            print(f"  {title:12s} {'OK ' if bad == 0 else 'BAD'} mismatches {bad} (drawn on {drawn} bars)")
     if compared == 0:
         print("error: no indicator columns found", file=sys.stderr)
         return 2
