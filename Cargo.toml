@@ -1,0 +1,10 @@
+[package]
+name = "aphelion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Aphelion mean-reversion indicator: SuperSmoother zones, X, COMBO and proxy long signals (pure computation)"
+
+[lints.rust]
+unsafe_code = "forbid"

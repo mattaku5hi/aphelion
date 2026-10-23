@@ -1,0 +1,338 @@
+//@version=6
+// Aphelion proxy long: the live paper rule of crypto-markets-extractor, approximated in Pine.
+// Rust source: the `aphelion` crate in this repo (src/live.rs long_scan, src/combo.rs, src/smc.rs, src/flow.rs).
+//  1. Setup: a closed signal bar (1h, or 4h for the 4h variant) is the first outer_rsi_macd LONG event of
+//     an excursion (src/combo.rs combo_flags/combo_step): within the last 3 bars the close was
+//     below Mean − 7.587·R (or a confirmed bullish RSI divergence whose pivot was), RSI(14) < 30 and a
+//     MACD(12,26,9) turn/cross up.
+//  2. 1h variant: entry after a 5m liquidity sweep + CHoCH up (smc_ok/smc_confirm) found from the last 5m
+//     bar of the signal hour up to SMC_WAIT bars later; entry at the next 5m open.
+//     4h variant: entry at the open right after the 4h signal bar (next_open), no 5m step.
+//  3. flow_exhaust at the entry: 4h flow toward the move (selling) and the last hour weaker. The server uses
+//     the exchange's real taker-buy volume; Pine has none, so the delta is APPROXIMATED here from
+//     lower-timeframe candles (volume of up candles counted as buying, of down candles as selling).
+// Not covered (scanner-only): position/exposure limits, F2 shadow filter, exits and adds, stale checks.
+indicator("Aphelion proxy long (outer_rsi_macd)", shorttitle = "Aphelion proxy", overlay = true, max_labels_count = 500, max_bars_back = 500)
+
+// ---------------------------------------------------------------- inputs
+V1H = "1h: 5m sweep + CHoCH entry"
+V4H = "4h: entry at the next open"
+G_V = "Variant"
+string variant  = input.string(V1H, "Variant (put the script on a 1h or 4h chart)", options = [V1H, V4H], group = G_V)
+
+G_S = "Setup (outer_rsi_macd)"
+float ssPeriod  = input.float(200.0, "SuperSmoother period (Mean and R)", minval = 2.0, group = G_S)
+int   warmBars  = input.int(400, "Warm-up bars (nothing before)", minval = 1, group = G_S)
+float outerK    = input.float(2.415 * math.pi, "Close below Mean − R ×", minval = 0.0, step = 0.001, group = G_S)
+int   zoneWindow = input.int(3, "Confluence window, bars", minval = 1, group = G_S)
+int   rsiLen    = input.int(14, "RSI length (Wilder)", minval = 2, group = G_S)
+float rsiLo     = input.float(30.0, "RSI below", group = G_S)
+int   macdFast  = input.int(12, "MACD fast", minval = 1, group = G_S)
+int   macdSlow  = input.int(26, "MACD slow", minval = 1, group = G_S)
+int   macdSig   = input.int(9, "MACD signal", minval = 1, group = G_S)
+int   pivLen    = input.int(5, "RSI pivot: bars each side", minval = 1, group = G_S)
+int   divMin    = input.int(5, "Divergence: min bars between pivots", minval = 1, group = G_S)
+int   divMax    = input.int(60, "Divergence: max bars between pivots", minval = 1, group = G_S)
+
+G_M = "1h entry: 5m sweep + CHoCH"
+string smcTf    = input.timeframe("5", "Confirmation timeframe", group = G_M)
+int   smcLook   = input.int(12, "Extreme look-back, bars (SMC_LOOK)", minval = 2, group = G_M)
+int   smcLiq    = input.int(48, "Liquidity range, bars (SMC_LIQ)", minval = 1, group = G_M)
+int   smcSwing  = input.int(6, "Swing range, bars (SMC_SWING)", minval = 1, group = G_M)
+int   smcWait   = input.int(12, "Wait after the signal close, bars (SMC_WAIT)", minval = 1, group = G_M)
+
+G_F = "flow_exhaust (approximation of the taker delta)"
+bool  useFlow   = input.bool(true, "Require flow_exhaust", group = G_F)
+string flowTf   = input.timeframe("1", "Flow timeframe (candle-direction volume)", group = G_F)
+float flowLongH = input.float(4.0, "Long window, hours", minval = 0.5, group = G_F)
+float flowShortH = input.float(1.0, "Short window, hours", minval = 0.25, group = G_F)
+
+G_D = "Display"
+bool  showMean  = input.bool(true, "Mean (target)", inline = "d1", group = G_D)
+bool  showInner = input.bool(true, "Mean − π·R", inline = "d1", group = G_D)
+bool  showSmall = input.bool(true, "Mean − 5.587·R", inline = "d2", group = G_D)
+bool  showOuter = input.bool(true, "Mean − 7.587·R", inline = "d2", group = G_D)
+bool  showSkips = input.bool(true, "Mark skipped setups (no SMC / flow)", group = G_D)
+color colBuy    = input.color(#26a69a, "Color", group = G_D)
+
+// ---------------------------------------------------------------- functions (same as aphelion.pine)
+superSmoother(float src, float period) =>
+    float w = math.sqrt(2.0) * math.pi / period
+    float a = math.exp(-w)
+    float c2 = 2.0 * a * math.cos(w)
+    float c3 = -a * a
+    float y = na
+    y := bar_index < 2 ? (bar_index == 0 ? src : y[1]) : (1.0 - c2 - c3) * src + c2 * y[1] + c3 * y[2]
+    y
+
+trueRange() =>
+    bar_index == 0 ? high - low : math.max(math.max(high - low, math.abs(high - close[1])), math.abs(low - close[1]))
+
+wilderFrom1(float x, int n) =>
+    float out = na
+    if bar_index == n
+        float s = 0.0
+        for j = n - 1 to 0
+            s += x[j]
+        out := s / n
+    else if bar_index > n
+        out := (out[1] * (n - 1) + x) / n
+    out
+
+emaFirst(float src, int n) =>
+    float alpha = 2.0 / (n + 1.0)
+    float e = na
+    e := na(e[1]) ? src : e[1] + alpha * (src - e[1])
+    e
+
+isPivot(float src, int p, bool isHigh) =>
+    bool ok = bar_index >= 2 * p and not na(src[p])
+    if ok
+        float c = src[p]
+        for j = 0 to 2 * p
+            if j != p
+                float v = src[j]
+                if na(v) or (isHigh ? v >= c : v <= c)
+                    ok := false
+                    break
+    ok
+
+lastTrue(bool flag) =>
+    var int last = na
+    if flag
+        last := bar_index
+    last
+
+inLookback(int last, int lookback) =>
+    not na(last) and last >= bar_index - lookback + 1
+
+// Long sweep + CHoCH known at the close of the last buffered bar b (src/smc.rs smc_ok, long side):
+// the lowest low x of the last `look` bars took out the lows of the `liq` bars before it, and b closes
+// above the highest high of the `swing` bars before x.
+smcOkLong(array<float> hs, array<float> ls, array<float> cs, int look, int liq, int swing) =>
+    int b = cs.size() - 1
+    bool ok = false
+    if b >= look + liq + swing
+        int lo = b + 1 - look
+        int x = lo
+        for j = lo to b
+            if ls.get(j) < ls.get(x)
+                x := j
+        if x < b and x >= liq + swing
+            float liqMin = ls.get(x - liq)
+            for j = x - liq to x - 1
+                liqMin := math.min(liqMin, ls.get(j))
+            float swingMax = hs.get(x - swing)
+            for j = x - swing to x - 1
+                swingMax := math.max(swingMax, hs.get(j))
+            ok := ls.get(x) < liqMin and cs.get(b) > swingMax
+    ok
+
+// (buy − sell) / total over the flow bars with open time in [fromMs, toMs); na unless every bar is present.
+flowDelta(array<int> ts, array<float> qs, array<float> ss, int fromMs, int toMs, int stepMs) =>
+    float q = 0.0
+    float s = 0.0
+    int cnt = 0
+    int n = ts.size()
+    if n > 0
+        for k = n - 1 to 0
+            int t = ts.get(k)
+            if t < fromMs
+                break
+            if t < toMs
+                q += qs.get(k)
+                s += ss.get(k)
+                cnt += 1
+    int need = math.round((toMs - fromMs) / stepMs)
+    cnt == need and q > 0.0 ? s / q : na
+
+// ---------------------------------------------------------------- setup on the chart (signal) timeframe
+bool done = barstate.isconfirmed
+float mean = superSmoother((high + low + close) / 3.0, ssPeriod)
+float r = superSmoother(trueRange(), ssPeriod)
+bool warm = bar_index >= warmBars
+
+float chg = bar_index >= 1 ? close - close[1] : 0.0
+float au = wilderFrom1(math.max(chg, 0.0), rsiLen)
+float ad = wilderFrom1(math.max(-chg, 0.0), rsiLen)
+float rsi = na(au) ? na : ad == 0.0 ? 100.0 : 100.0 - 100.0 / (1.0 + au / ad)
+
+float macdLine = emaFirst(close, macdFast) - emaFirst(close, macdSlow)
+float hist = macdLine - emaFirst(macdLine, macdSig)
+bool macdBuy = (bar_index >= 2 and hist[1] < 0.0 and hist > hist[1] and hist[1] <= hist[2]) or (bar_index >= 1 and hist[1] < 0.0 and hist >= 0.0)
+
+bool pivLo = isPivot(rsi, pivLen, false)
+var int plT = na
+var float plLow = na
+var float plRsi = na
+bool divBuy = false
+if pivLo
+    int t = bar_index - pivLen
+    if not na(plT) and t - plT >= divMin and t - plT <= divMax and low[pivLen] < plLow and rsi[pivLen] > plRsi
+        divBuy := true
+    plT := t
+    plLow := low[pivLen]
+    plRsi := rsi[pivLen]
+
+float zLong = na
+if warm and not na(mean) and not na(r) and r > 0.0 and not na(rsi)
+    zLong := (mean - close) / r
+bool zf = not na(zLong) and zLong >= outerK
+// A divergence counts when its pivot bar was beyond the zone.
+bool zext = zf or (divBuy and zf[pivLen])
+bool zw = inLookback(lastTrue(zext), zoneWindow)
+bool rw = inLookback(lastTrue(not na(rsi) and rsi < rsiLo), zoneWindow)
+bool mw = inLookback(lastTrue(macdBuy), zoneWindow)
+
+// First event per excursion: re-armed once the zone condition lapsed.
+var bool armed = true
+bool setupRaw = false
+if warm
+    armed := armed or not zw
+    if armed and not na(zLong) and zw and rw and mw
+        setupRaw := true
+        armed := false
+bool setup = done and setupRaw
+
+// ---------------------------------------------------------------- lower-timeframe data
+[m5T, m5H, m5L, m5C] = request.security_lower_tf(syminfo.tickerid, smcTf, [time, high, low, close], ignore_invalid_timeframe = true)
+[fT, fQ, fS] = request.security_lower_tf(syminfo.tickerid, flowTf, [time, volume * close, close > open ? volume * close : close < open ? -volume * close : 0.0], ignore_invalid_timeframe = true)
+
+int smcMs = timeframe.in_seconds(smcTf) * 1000
+int flowMs = timeframe.in_seconds(flowTf) * 1000
+int longMs = int(flowLongH * 3600000.0)
+int shortMs = int(flowShortH * 3600000.0)
+int flowCap = int(math.ceil((longMs + timeframe.in_seconds() * 1000.0) / flowMs)) + 10
+int smcCap = smcLook + smcLiq + smcSwing + 50
+
+// Flow bars (closed ones only), oldest first.
+var array<int> qT = array.new<int>()
+var array<float> qQ = array.new<float>()
+var array<float> qS = array.new<float>()
+int nF = fT.size()
+if useFlow and nF > 0
+    for k = 0 to nF - 1
+        int t = fT.get(k)
+        if not done and t + flowMs > timenow
+            break
+        if qT.size() == 0 or t > qT.last()
+            float q = fQ.get(k)
+            float sg = fS.get(k)
+            if not na(q) and not na(sg)
+                qT.push(t)
+                qQ.push(q)
+                qS.push(sg)
+    while qT.size() > flowCap
+        qT.shift()
+        qQ.shift()
+        qS.shift()
+
+// flow_exhaust (long) at entryMs: the long-window flow sells (d4 < 0) and the last hour is weaker (d1 > d4).
+// Returns 1 pass, 0 fail, -1 unknown coverage (the server skips the signal then).
+flowCheck(int entryMs) =>
+    float d4 = flowDelta(qT, qQ, qS, entryMs - longMs, entryMs, flowMs)
+    float d1 = flowDelta(qT, qQ, qS, entryMs - shortMs, entryMs, flowMs)
+    na(d4) or na(d1) ? -1 : d4 < 0.0 and d1 > d4 ? 1 : 0
+
+// ---------------------------------------------------------------- entry
+var label setupLbl = na
+var int setupBar = na
+var int pendFrom = na
+var int pendTo = na
+bool entryNow = false
+bool skipNow = false
+string skipWhy = ""
+
+if setup
+    setupBar := bar_index
+    setupLbl := label.new(bar_index, low, "Aphelion setup", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(colBuy, 65), textcolor = color.white, size = size.small, tooltip = "outer_rsi_macd LONG: z = " + str.tostring(zLong, "#.##") + " R, RSI " + str.tostring(rsi, "#.#"))
+    if variant == V1H
+        // 5m bars from the last one of the signal bar up to smcWait bars after its close.
+        pendFrom := time_close - smcMs
+        pendTo := time_close + (smcWait - 1) * smcMs
+    else
+        int fc = useFlow ? flowCheck(time_close) : 1
+        if fc == 1
+            entryNow := true
+        else
+            skipNow := true
+            skipWhy := fc == 0 ? "flow ✗" : "flow ?"
+
+var array<int> sT = array.new<int>()
+var array<float> sH = array.new<float>()
+var array<float> sL = array.new<float>()
+var array<float> sC = array.new<float>()
+int nS = m5T.size()
+if variant == V1H and nS > 0
+    for k = 0 to nS - 1
+        int t = m5T.get(k)
+        if not done and t + smcMs > timenow
+            break
+        if sT.size() > 0 and t <= sT.last()
+            continue
+        if sT.size() > 0 and t != sT.last() + smcMs
+            // Gap: the sweep needs contiguous bars.
+            sT.clear()
+            sH.clear()
+            sL.clear()
+            sC.clear()
+        sT.push(t)
+        sH.push(m5H.get(k))
+        sL.push(m5L.get(k))
+        sC.push(m5C.get(k))
+        while sT.size() > smcCap
+            sT.shift()
+            sH.shift()
+            sL.shift()
+            sC.shift()
+        if not na(pendFrom) and t >= pendFrom and t <= pendTo
+            if smcOkLong(sH, sL, sC, smcLook, smcLiq, smcSwing)
+                int fc = useFlow ? flowCheck(t + smcMs) : 1
+                if fc == 1
+                    entryNow := true
+                else
+                    skipNow := true
+                    skipWhy := fc == 0 ? "flow ✗" : "flow ?"
+                pendFrom := na
+                pendTo := na
+// The wait window passed without a confirmation (or without 5m data).
+if variant == V1H and done and not na(pendTo) and time_close >= pendTo + smcMs
+    skipNow := true
+    skipWhy := sT.size() == 0 or sT.last() < pendTo ? "no 5m data" : "no SMC"
+    pendFrom := na
+    pendTo := na
+
+if entryNow
+    string txt = variant == V1H ? "Aphelion LONG\nentry" : "Aphelion 4h LONG\nnext open"
+    if setupBar == bar_index and not na(setupLbl)
+        setupLbl.set_text(txt)
+        setupLbl.set_color(colBuy)
+    else
+        label.new(bar_index, low, txt, yloc = yloc.belowbar, style = label.style_label_up, color = colBuy, textcolor = color.white, size = size.small)
+if skipNow and showSkips and not na(setupLbl)
+    setupLbl.set_text("Aphelion setup\n" + skipWhy)
+    setupLbl.set_color(color.new(color.gray, 50))
+
+// ---------------------------------------------------------------- display
+plot(warm and showMean ? mean : na, "Mean", color.gray, 2)
+plot(warm and showInner ? mean - math.pi * r : na, "Inner -", color.new(colBuy, 70))
+plot(warm and showSmall ? mean - (2.415 * math.pi - 2.0) * r : na, "Small -", color.new(colBuy, 50))
+plot(warm and showOuter ? mean - outerK * r : na, "Outer -", color.new(colBuy, 0), 2)
+
+// Data-window values for the parity check (parity/README.md).
+plot(r, "R", display = display.data_window, precision = 10)
+plot(zLong, "Z long", display = display.data_window, precision = 6)
+plot(setup ? 1 : 0, "Aphelion long", display = display.data_window, precision = 0)
+plot(entryNow ? 1 : 0, "Entry", display = display.data_window, precision = 0)
+plot(bar_index, "Bar index", display = display.data_window, precision = 0)
+
+int expectSec = variant == V1H ? 3600 : 14400
+var table warn = table.new(position.top_right, 1, 1)
+if barstate.islast and timeframe.in_seconds() != expectSec
+    table.cell(warn, 0, 0, "Aphelion proxy: the " + (variant == V1H ? "1h" : "4h") + " variant expects a " + (variant == V1H ? "1h" : "4h") + " chart", bgcolor = color.new(color.orange, 20), text_color = color.white)
+
+// ---------------------------------------------------------------- alerts
+// Setup: at the signal bar close. Entry (1h): as soon as the confirming 5m bar closes when the alert
+// frequency is "Once per bar"; with "Once per bar close" it fires at the close of the chart bar.
+alertcondition(setup, "Aphelion proxy setup", "Aphelion proxy LONG setup {{ticker}} {{interval}} close {{close}}")
+alertcondition(entryNow, "Aphelion proxy entry", "Aphelion proxy LONG entry {{ticker}} {{interval}} price {{close}}")

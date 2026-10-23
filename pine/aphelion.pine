@@ -1,0 +1,286 @@
+//@version=6
+// Aphelion: Mean/R zones, X band, X and COMBO labels.
+// Mean-reversion indicator: SuperSmoother Mean, R from the true range, k·R zones, X band/labels, COMBO confirmations.
+// Port of the Rust crate `aphelion` in this repo: src/zones.rs (make_ind SS/Range), src/oscillators.rs
+// (Aux RSI/MACD/pivots), src/x.rs (X band and labels), src/combo.rs (macd_signal).
+// Signals use closed bars only: labels and alerts appear at the bar close and never move.
+indicator("Aphelion X/COMBO", shorttitle = "Aphelion", overlay = true, max_labels_count = 500, max_bars_back = 500)
+
+// ---------------------------------------------------------------- inputs
+G_Z = "Zones"
+float ssPeriod   = input.float(200.0, "SuperSmoother period (Mean and R)", minval = 2.0, group = G_Z)
+int   warmBars   = input.int(400, "Warm-up bars (nothing shown before)", minval = 1, group = G_Z)
+float kInner     = input.float(math.pi, "Inner band, R (π)", minval = 0.0, step = 0.001, group = G_Z)
+float outerK     = input.float(2.415 * math.pi, "Outer band, R (small = outer−2, deep = outer+2, extra = outer+4)", minval = 2.0, step = 0.001, group = G_Z)
+bool  showMean   = input.bool(true, "Mean", inline = "z1", group = G_Z)
+bool  showInner  = input.bool(true, "±π", inline = "z1", group = G_Z)
+bool  showSmall  = input.bool(true, "±5.587", inline = "z1", group = G_Z)
+bool  showOuter  = input.bool(true, "±7.587", inline = "z2", group = G_Z)
+bool  showDeep   = input.bool(true, "±9.587", inline = "z2", group = G_Z)
+bool  showExtra  = input.bool(false, "±11.587", inline = "z2", group = G_Z)
+
+G_X = "X (band and signal)"
+int   stochLen   = input.int(21, "Stochastic length (log prices)", minval = 2, group = G_X)
+float gradA      = input.float(0.75, "Gradation a: g = a·g[1] + k·(S − S0)", step = 0.01, group = G_X)
+float gradK      = input.float(1.0, "Gradation k", step = 0.1, group = G_X)
+float gradS0     = input.float(76.0, "Gradation S0", step = 1.0, group = G_X)
+float gradOn     = input.float(15.0, "Band on while g >", step = 1.0, group = G_X)
+float startR     = input.float(math.pi, "Band start: |open − Mean| ≥ R ×", step = 0.001, group = G_X)
+float zoneR      = input.float(2.415 * math.pi - 2.0, "X: |close − Mean| ≥ R ×", step = 0.001, group = G_X)
+int   repBars    = input.int(5, "Repeat filter: bars", minval = 0, group = G_X)
+float repPctIn   = input.float(1.0, "Repeat filter: % of price", minval = 0.0, step = 0.1, group = G_X)
+
+G_C = "COMBO (X + confirmations)"
+int   comboLook  = input.int(10, "Lookback, bars (X bar included)", minval = 1, group = G_C)
+int   comboMin   = input.int(2, "Confirmations required", minval = 1, maxval = 3, group = G_C)
+bool  useRsi     = input.bool(true, "RSI", inline = "c1", group = G_C)
+bool  useMacd    = input.bool(true, "MACD", inline = "c1", group = G_C)
+bool  useDiv     = input.bool(true, "Divergence", inline = "c1", group = G_C)
+int   rsiLen     = input.int(14, "RSI length (Wilder)", minval = 2, group = G_C)
+float rsiHi      = input.float(70.0, "RSI sell above", group = G_C)
+float rsiLo      = input.float(30.0, "RSI buy below", group = G_C)
+int   macdFast   = input.int(12, "MACD fast", minval = 1, group = G_C)
+int   macdSlow   = input.int(26, "MACD slow", minval = 1, group = G_C)
+int   macdSig    = input.int(9, "MACD signal", minval = 1, group = G_C)
+int   pivLen     = input.int(5, "RSI pivot: bars each side", minval = 1, group = G_C)
+int   divMin     = input.int(5, "Divergence: min bars between pivots", minval = 1, group = G_C)
+int   divMax     = input.int(60, "Divergence: max bars between pivots", minval = 1, group = G_C)
+
+G_D = "Display and alerts"
+bool  showBand   = input.bool(true, "X band background", group = G_D)
+bool  showX      = input.bool(true, "X labels", group = G_D)
+bool  showCombo  = input.bool(true, "COMBO labels (replace the X label on the same bar)", group = G_D)
+bool  showConf   = input.bool(false, "COMBO confirmations (RSI / MACD / divergence marks)", group = G_D)
+float alertK     = input.float(2.415 * math.pi, "Alert: close beyond Mean ± k·R, k =", minval = 0.0, step = 0.001, group = G_D)
+color colSell    = input.color(#e53935, "Sell", inline = "col", group = G_D)
+color colBuy     = input.color(#26a69a, "Buy", inline = "col", group = G_D)
+
+float repPct = repPctIn / 100.0
+
+// ---------------------------------------------------------------- functions
+// Ehlers 2-pole SuperSmoother, seeded with the first value on the first two bars (src/indicators.rs supersmoother).
+superSmoother(float src, float period) =>
+    float w = math.sqrt(2.0) * math.pi / period
+    float a = math.exp(-w)
+    float c2 = 2.0 * a * math.cos(w)
+    float c3 = -a * a
+    float y = na
+    y := bar_index < 2 ? (bar_index == 0 ? src : y[1]) : (1.0 - c2 - c3) * src + c2 * y[1] + c3 * y[2]
+    y
+
+// True range; the first bar uses high − low.
+trueRange() =>
+    bar_index == 0 ? high - low : math.max(math.max(high - low, math.abs(high - close[1])), math.abs(low - close[1]))
+
+// Signed distance from the Mean in R, positive on the extended side (above for sell, below for buy).
+distR(float x, float m, float rr, bool sell) =>
+    float d = na
+    if not na(m) and not na(rr) and rr > 0.0
+        float v = (x - m) / rr
+        d := sell ? v : -v
+    d
+
+// Wilder average of a series valid from bar 1, seeded with the plain mean of bars 1..n (src/indicators.rs wilder(x, n, 1)).
+wilderFrom1(float x, int n) =>
+    float out = na
+    if bar_index == n
+        float s = 0.0
+        for j = n - 1 to 0
+            s += x[j]
+        out := s / n
+    else if bar_index > n
+        out := (out[1] * (n - 1) + x) / n
+    out
+
+// EMA seeded with the first value (src/indicators.rs ema).
+emaFirst(float src, int n) =>
+    float alpha = 2.0 / (n + 1.0)
+    float e = na
+    e := na(e[1]) ? src : e[1] + alpha * (src - e[1])
+    e
+
+// Strict pivot of `src` at bar_index − p: unique extreme of the 2p+1 window, no na inside.
+isPivot(float src, int p, bool isHigh) =>
+    bool ok = bar_index >= 2 * p and not na(src[p])
+    if ok
+        float c = src[p]
+        for j = 0 to 2 * p
+            if j != p
+                float v = src[j]
+                if na(v) or (isHigh ? v >= c : v <= c)
+                    ok := false
+                    break
+    ok
+
+// Same-direction repeat filter: a flag passes when the previous passed one is at least `bars` bars
+// or `pct` of price (close to close) away (src/x.rs repeat_filter).
+repeatFilter(bool flag, int bars, float pct) =>
+    var int lastIdx = na
+    var float lastClose = na
+    bool ok = false
+    if flag
+        ok := na(lastIdx) or bar_index - lastIdx >= bars or math.abs(close / lastClose - 1.0) >= pct
+        if ok
+            lastIdx := bar_index
+            lastClose := close
+    ok
+
+// Bar index of the last true flag.
+lastTrue(bool flag) =>
+    var int last = na
+    if flag
+        last := bar_index
+    last
+
+inLookback(int last, int lookback) =>
+    not na(last) and last >= bar_index - lookback + 1
+
+// ---------------------------------------------------------------- zones
+float mean = superSmoother((high + low + close) / 3.0, ssPeriod)
+float r = superSmoother(trueRange(), ssPeriod)
+bool warm = bar_index >= warmBars
+float zClose = distR(close, mean, r, true)
+
+// ---------------------------------------------------------------- X band (gradation)
+float logHi = ta.highest(math.log(high), stochLen)
+float logLo = ta.lowest(math.log(low), stochLen)
+float stoch = na
+if bar_index >= stochLen - 1
+    stoch := logHi > logLo ? 100.0 * (math.log(close) - logLo) / (logHi - logLo) : 0.0
+
+// Unclipped EMA per side; 0 while the stochastic is not available. Buy side uses 100 − S.
+var float gSell = 0.0
+var float gBuy = 0.0
+if bar_index >= 1
+    if not na(stoch)
+        gSell := gradA * gSell + gradK * (stoch - gradS0)
+        gBuy := gradA * gBuy + gradK * ((100.0 - stoch) - gradS0)
+    else
+        gSell := 0.0
+        gBuy := 0.0
+
+float dOpenSell = distR(open, mean, r, true)
+float dOpenBuy = distR(open, mean, r, false)
+var bool bandSell = false
+var bool bandBuy = false
+bool bandSellPrev = bandSell
+bool bandBuyPrev = bandBuy
+bandSell := gSell > gradOn and (bandSellPrev or (not na(dOpenSell) and dOpenSell >= startR))
+bandBuy := gBuy > gradOn and (bandBuyPrev or (not na(dOpenBuy) and dOpenBuy >= startR))
+
+// ---------------------------------------------------------------- X
+float dCloseSell = distR(close, mean, r, true)
+float dCloseBuy = distR(close, mean, r, false)
+bool xWarm = bar_index >= math.max(warmBars, 1)
+bool xSellCand = xWarm and bandSellPrev and not bandSell and not na(dCloseSell) and dCloseSell >= zoneR
+bool xBuyCand = xWarm and bandBuyPrev and not bandBuy and not na(dCloseBuy) and dCloseBuy >= zoneR
+bool xSell = repeatFilter(xSellCand, repBars, repPct)
+bool xBuy = repeatFilter(xBuyCand, repBars, repPct)
+
+// ---------------------------------------------------------------- confirmations (RSI, MACD, divergence)
+float chg = bar_index >= 1 ? close - close[1] : 0.0
+float au = wilderFrom1(math.max(chg, 0.0), rsiLen)
+float ad = wilderFrom1(math.max(-chg, 0.0), rsiLen)
+float rsi = na(au) ? na : ad == 0.0 ? 100.0 : 100.0 - 100.0 / (1.0 + au / ad)
+
+float macdLine = emaFirst(close, macdFast) - emaFirst(close, macdSlow)
+float hist = macdLine - emaFirst(macdLine, macdSig)
+bool macdSellRaw = (bar_index >= 2 and hist[1] > 0.0 and hist < hist[1] and hist[1] >= hist[2]) or (bar_index >= 1 and hist[1] > 0.0 and hist <= 0.0)
+bool macdBuyRaw = (bar_index >= 2 and hist[1] < 0.0 and hist > hist[1] and hist[1] <= hist[2]) or (bar_index >= 1 and hist[1] < 0.0 and hist >= 0.0)
+
+// Regular divergence between consecutive RSI pivots, flagged at the confirmation bar (pivot + pivLen).
+bool pivHi = isPivot(rsi, pivLen, true)
+bool pivLo = isPivot(rsi, pivLen, false)
+var int phT = na
+var float phHigh = na
+var float phRsi = na
+var int plT = na
+var float plLow = na
+var float plRsi = na
+bool divSell = false
+bool divBuy = false
+if pivHi
+    int t = bar_index - pivLen
+    if not na(phT) and t - phT >= divMin and t - phT <= divMax and high[pivLen] > phHigh and rsi[pivLen] < phRsi
+        divSell := true
+    phT := t
+    phHigh := high[pivLen]
+    phRsi := rsi[pivLen]
+if pivLo
+    int t = bar_index - pivLen
+    if not na(plT) and t - plT >= divMin and t - plT <= divMax and low[pivLen] < plLow and rsi[pivLen] > plRsi
+        divBuy := true
+    plT := t
+    plLow := low[pivLen]
+    plRsi := rsi[pivLen]
+
+bool rsiSell = repeatFilter(not na(rsi) and rsi > rsiHi, repBars, repPct)
+bool rsiBuy = repeatFilter(not na(rsi) and rsi < rsiLo, repBars, repPct)
+bool macdSell = repeatFilter(macdSellRaw, repBars, repPct)
+bool macdBuy = repeatFilter(macdBuyRaw, repBars, repPct)
+
+int lastRsiSell = lastTrue(rsiSell)
+int lastRsiBuy = lastTrue(rsiBuy)
+int lastMacdSell = lastTrue(macdSell)
+int lastMacdBuy = lastTrue(macdBuy)
+int lastDivSell = lastTrue(divSell)
+int lastDivBuy = lastTrue(divBuy)
+
+int nConfSell = (useRsi and inLookback(lastRsiSell, comboLook) ? 1 : 0) + (useMacd and inLookback(lastMacdSell, comboLook) ? 1 : 0) + (useDiv and inLookback(lastDivSell, comboLook) ? 1 : 0)
+int nConfBuy = (useRsi and inLookback(lastRsiBuy, comboLook) ? 1 : 0) + (useMacd and inLookback(lastMacdBuy, comboLook) ? 1 : 0) + (useDiv and inLookback(lastDivBuy, comboLook) ? 1 : 0)
+bool comboSell = xSell and nConfSell >= comboMin
+bool comboBuy = xBuy and nConfBuy >= comboMin
+
+// ---------------------------------------------------------------- display
+bool done = barstate.isconfirmed
+color cMean = color.new(color.gray, 0)
+color cInner = color.new(color.gray, 40)
+plot(warm and showMean ? mean : na, "Mean", cMean, 2)
+plot(warm and showInner ? mean + kInner * r : na, "Inner +", cInner)
+plot(warm and showInner ? mean - kInner * r : na, "Inner -", cInner)
+plot(warm and showSmall ? mean + (outerK - 2.0) * r : na, "Small +", color.new(colSell, 50))
+plot(warm and showSmall ? mean - (outerK - 2.0) * r : na, "Small -", color.new(colBuy, 50))
+plot(warm and showOuter ? mean + outerK * r : na, "Outer +", color.new(colSell, 25), 2)
+plot(warm and showOuter ? mean - outerK * r : na, "Outer -", color.new(colBuy, 25), 2)
+plot(warm and showDeep ? mean + (outerK + 2.0) * r : na, "Deep +", color.new(colSell, 0))
+plot(warm and showDeep ? mean - (outerK + 2.0) * r : na, "Deep -", color.new(colBuy, 0))
+plot(warm and showExtra ? mean + (outerK + 4.0) * r : na, "Extra +", color.new(colSell, 0), 1, plot.style_circles)
+plot(warm and showExtra ? mean - (outerK + 4.0) * r : na, "Extra -", color.new(colBuy, 0), 1, plot.style_circles)
+
+bgcolor(showBand and warm and done and bandSell ? color.new(colSell, 82) : na, title = "X band sell")
+bgcolor(showBand and warm and done and bandBuy ? color.new(colBuy, 82) : na, title = "X band buy")
+
+plotshape(showConf and warm and rsiSell, "RSI sell", shape.triangledown, location.abovebar, color.new(colSell, 40), size = size.tiny, text = "R")
+plotshape(showConf and warm and rsiBuy, "RSI buy", shape.triangleup, location.belowbar, color.new(colBuy, 40), size = size.tiny, text = "R")
+plotshape(showConf and warm and macdSell, "MACD sell", shape.diamond, location.abovebar, color.new(colSell, 40), size = size.tiny, text = "M")
+plotshape(showConf and warm and macdBuy, "MACD buy", shape.diamond, location.belowbar, color.new(colBuy, 40), size = size.tiny, text = "M")
+plotshape(showConf and warm and divSell, "Divergence sell", shape.circle, location.abovebar, color.new(colSell, 40), size = size.tiny)
+plotshape(showConf and warm and divBuy, "Divergence buy", shape.circle, location.belowbar, color.new(colBuy, 40), size = size.tiny)
+
+if done and xSell and (showX or (showCombo and comboSell))
+    bool asCombo = showCombo and comboSell
+    label.new(bar_index, high, asCombo ? "COMBO\nSHORT" : "SHORT\nX", yloc = yloc.abovebar, style = label.style_label_down, color = asCombo ? #8e0000 : colSell, textcolor = color.white, size = size.small)
+if done and xBuy and (showX or (showCombo and comboBuy))
+    bool asCombo = showCombo and comboBuy
+    label.new(bar_index, low, asCombo ? "COMBO\nLONG" : "LONG\nX", yloc = yloc.belowbar, style = label.style_label_up, color = asCombo ? #00594f : colBuy, textcolor = color.white, size = size.small)
+
+// Data-window values for the parity check (parity/README.md); they are not drawn on the chart.
+plot(r, "R", display = display.data_window, precision = 10)
+plot(zClose, "Z", display = display.data_window, precision = 6)
+plot(gSell, "G sell", display = display.data_window, precision = 6)
+plot(gBuy, "G buy", display = display.data_window, precision = 6)
+plot(bandSell ? 1 : 0, "Band sell", display = display.data_window, precision = 0)
+plot(bandBuy ? 1 : 0, "Band buy", display = display.data_window, precision = 0)
+plot(done and xSell ? 1 : 0, "X sell", display = display.data_window, precision = 0)
+plot(done and xBuy ? 1 : 0, "X buy", display = display.data_window, precision = 0)
+plot(done and comboSell ? 1 : 0, "COMBO sell", display = display.data_window, precision = 0)
+plot(done and comboBuy ? 1 : 0, "COMBO buy", display = display.data_window, precision = 0)
+plot(bar_index, "Bar index", display = display.data_window, precision = 0)
+
+// ---------------------------------------------------------------- alerts (closed bars only)
+alertcondition(done and xSell, "Aphelion SHORT X", "Aphelion SHORT X {{ticker}} {{interval}} close {{close}}")
+alertcondition(done and xBuy, "Aphelion LONG X", "Aphelion LONG X {{ticker}} {{interval}} close {{close}}")
+alertcondition(done and comboSell, "Aphelion COMBO SHORT", "Aphelion COMBO SHORT {{ticker}} {{interval}} close {{close}}")
+alertcondition(done and comboBuy, "Aphelion COMBO LONG", "Aphelion COMBO LONG {{ticker}} {{interval}} close {{close}}")
+alertcondition(done and warm and not na(zClose) and zClose >= alertK, "Aphelion close above Mean + k·R", "Aphelion close above Mean + k·R {{ticker}} {{interval}} close {{close}}")
+alertcondition(done and warm and not na(zClose) and zClose <= -alertK, "Aphelion close below Mean − k·R", "Aphelion close below Mean − k·R {{ticker}} {{interval}} close {{close}}")

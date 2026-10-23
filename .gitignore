@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# chart exports and market data never go into the repo
+*.csv
+/target
